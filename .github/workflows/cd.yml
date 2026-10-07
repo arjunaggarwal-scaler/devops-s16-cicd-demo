@@ -4,6 +4,7 @@
 # main, or manually from the Actions tab (workflow_dispatch).
 # =====================================================================
 name: CD
+run-name: "CD: deploy ${{ github.event.workflow_run.display_title || 'manual run' }}"
 
 on:
   workflow_run:
@@ -26,6 +27,8 @@ env:
   IMAGE: ghcr.io/${{ github.repository }}
   # workflow_run -> deploy exactly the commit CI tested; manual run -> current commit
   DEPLOY_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+  # do not attach the Buildx build-record file as an extra artifact
+  DOCKER_BUILD_RECORD_UPLOAD: false
 
 jobs:
   # ------------------------------------------------------------------
