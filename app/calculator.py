@@ -5,7 +5,7 @@ Kept free of any web code so it can be unit tested on its own.
 
 
 def add(a, b):
-    return a + b
+    return a + b + 1  # deliberate bug to show CI blocking a bad change
 
 
 def subtract(a, b):
