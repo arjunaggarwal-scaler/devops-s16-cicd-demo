@@ -68,3 +68,16 @@ gh secret set DEMO_API_KEY --body "<any demo value>"
 ```
 
 `GITHUB_TOKEN` is provided automatically; `cd.yml` grants it `packages: write` to push to GHCR.
+
+## Make targets
+
+A `Makefile` wraps the same commands the CI pipeline runs, so you can reproduce each stage locally:
+
+```bash
+make install   # install dev dependencies
+make lint      # flake8 (same as the CI "lint" job)
+make test      # pytest + coverage (90% gate, same as CI)
+make build     # versioned source bundle in dist/
+make run       # build the image and run it on http://localhost:21600/
+make stop      # remove the local container
+```
