@@ -1,0 +1,50 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: calculator-api
+  labels:
+    app: calculator-api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: calculator-api
+  template:
+    metadata:
+      labels:
+        app: calculator-api
+    spec:
+      # Credentials for pulling from GHCR (created by the CD workflow)
+      imagePullSecrets:
+        - name: ghcr-pull
+      containers:
+        - name: calculator-api
+          # The CD workflow replaces ":latest" with the immutable ":sha-<commit>" tag
+          image: ghcr.io/arjunaggarwal-scaler/devops-s16-cicd-demo:latest
+          ports:
+            - containerPort: 8000
+          env:
+            - name: API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: calculator-api-key
+                  key: api-key
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi

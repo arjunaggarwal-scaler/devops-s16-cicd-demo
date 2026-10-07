@@ -1,0 +1,165 @@
+# =====================================================================
+# CD pipeline: publish image to GHCR -> deploy to Kubernetes (kind)
+# Starts automatically when the CI workflow finishes successfully on
+# main, or manually from the Actions tab (workflow_dispatch).
+# =====================================================================
+name: CD
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write   # lets GITHUB_TOKEN push to ghcr.io
+
+# Never run two deployments at the same time
+concurrency:
+  group: cd-production
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ghcr.io/${{ github.repository }}
+  # workflow_run -> deploy exactly the commit CI tested; manual run -> current commit
+  DEPLOY_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+jobs:
+  # ------------------------------------------------------------------
+  publish:
+    name: Publish image to GHCR
+    # Only continue when CI passed for a push (not for a PR / failed run)
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push')
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.vars.outputs.image }}
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - name: Checkout the tested commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.DEPLOY_SHA }}
+
+      - name: Compute image tag
+        id: vars
+        run: |
+          SHORT_SHA="${DEPLOY_SHA::7}"
+          echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+          echo "image=${IMAGE}:sha-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate tags and labels
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=sha-${{ steps.vars.outputs.short_sha }}
+            type=raw,value=latest
+
+      - name: Build and push image
+        id: push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          build-args: GIT_SHA=${{ env.DEPLOY_SHA }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Image summary
+        run: |
+          echo "### Published image" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`${{ steps.vars.outputs.image }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Digest: \`${{ steps.push.outputs.digest }}\`" >> "$GITHUB_STEP_SUMMARY"
+
+  # ------------------------------------------------------------------
+  deploy:
+    name: Deploy to Kubernetes (kind)
+    needs: publish
+    runs-on: ubuntu-latest
+    environment:
+      name: kind-demo
+    steps:
+      - name: Checkout the tested commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.DEPLOY_SHA }}
+
+      - name: Create a kind cluster on the runner
+        uses: helm/kind-action@v1.15.1
+        with:
+          cluster_name: s16-ci
+
+      - name: Show cluster
+        run: |
+          kubectl cluster-info
+          kubectl get nodes -o wide
+
+      - name: Create pull secret and app secret
+        env:
+          DEMO_API_KEY: ${{ secrets.DEMO_API_KEY }}
+        run: |
+          kubectl create secret docker-registry ghcr-pull \
+            --docker-server=${{ env.REGISTRY }} \
+            --docker-username=${{ github.actor }} \
+            --docker-password=${{ secrets.GITHUB_TOKEN }}
+          kubectl create secret generic calculator-api-key \
+            --from-literal=api-key="$DEMO_API_KEY"
+
+      - name: Apply manifests with the new image tag
+        run: |
+          sed "s|${IMAGE}:latest|${{ needs.publish.outputs.image }}|" k8s/deployment.yaml \
+            | kubectl apply -f -
+          kubectl apply -f k8s/service.yaml
+
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/calculator-api --timeout=180s
+          kubectl get deploy,rs,pods,svc -l app=calculator-api -o wide
+          kubectl get deploy calculator-api -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
+
+      - name: Smoke test through the Service
+        env:
+          DEMO_API_KEY: ${{ secrets.DEMO_API_KEY }}
+        run: |
+          kubectl port-forward svc/calculator-api 8080:80 > /tmp/pf.log 2>&1 &
+          for i in $(seq 1 20); do curl -fs http://localhost:8080/health && break; sleep 1; done
+          echo
+          curl -fsS http://localhost:8080/ ; echo
+          curl -fsS "http://localhost:8080/api/divide?a=22&b=7" ; echo
+          curl -fsS -H "X-API-Key: $DEMO_API_KEY" http://localhost:8080/api/secure/ping ; echo
+
+      - name: Debug info on failure
+        if: failure()
+        run: |
+          kubectl describe pods -l app=calculator-api
+          kubectl get events --sort-by=.lastTimestamp | tail -30
+
+      - name: Deployment summary
+        run: |
+          {
+            echo "### Deployed \`${{ needs.publish.outputs.image }}\` to kind"
+            echo ""
+            echo '```'
+            kubectl get pods -l app=calculator-api -o wide
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

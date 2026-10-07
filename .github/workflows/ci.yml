@@ -1,0 +1,225 @@
+# =====================================================================
+# CI pipeline: lint -> test (matrix) -> build -> integration test
+# Runs on every push / pull request to main, and manually.
+# =====================================================================
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Least privilege for the automatic GITHUB_TOKEN
+permissions:
+  contents: read
+
+# A newer push to the same branch cancels the older, still-running CI
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.13"
+  IMAGE_NAME: s16-calculator-api
+
+jobs:
+  # ------------------------------------------------------------------
+  lint:
+    name: Lint (flake8)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v7
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install flake8
+        run: pip install flake8==7.4.1
+
+      - name: Run flake8
+        run: flake8 . --count --show-source --statistics
+
+  # ------------------------------------------------------------------
+  security-check:
+    name: Security Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v7
+
+      - name: Check for committed sensitive files
+        run: |
+          echo "Checking repository for common sensitive files..."
+          if find . -path ./.git -prune -o -type f \
+               \( -name ".env" -o -name "*.pem" -o -name "*.key" -o -name "id_rsa*" \) -print | grep .; then
+            echo "::error::Potential sensitive file found."
+            exit 1
+          fi
+          echo "No common sensitive files found."
+
+  # ------------------------------------------------------------------
+  test:
+    name: Test (py${{ matrix.python-version }}, ${{ matrix.os }})
+    needs: lint
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ["3.12", "3.13", "3.14"]
+        include:
+          - os: windows-latest
+            python-version: "3.13"
+          - os: macos-latest
+            python-version: "3.13"
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v7
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Show runner details
+        shell: bash
+        run: |
+          echo "Runner OS   : ${{ runner.os }} / ${{ runner.arch }}"
+          echo "Runner name : ${{ runner.name }}"
+          python --version
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Run unit tests with coverage
+        run: >
+          pytest
+          --junitxml=reports/junit.xml
+          --cov=app --cov-report=term-missing
+          --cov-report=xml:reports/coverage.xml
+          --cov-report=html:reports/htmlcov
+          --cov-fail-under=90
+
+      - name: Upload test & coverage reports
+        if: always()   # upload even when tests fail, so the report can be inspected
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-reports-${{ matrix.os }}-py${{ matrix.python-version }}
+          path: reports/
+          retention-days: 14
+
+  # ------------------------------------------------------------------
+  build:
+    name: Build (bundle + Docker image)
+    needs: [test, security-check]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v7
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Build application bundle
+        run: ./build.sh
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: calculator-build
+          path: |
+            build/build-info.txt
+            dist/
+          retention-days: 14
+
+      - name: Build Docker image
+        run: |
+          docker build --build-arg GIT_SHA=${{ github.sha }} \
+            -t ${{ env.IMAGE_NAME }}:${{ github.sha }} .
+          docker image ls ${{ env.IMAGE_NAME }}
+
+      - name: Save Docker image as a tarball
+        run: docker save ${{ env.IMAGE_NAME }}:${{ github.sha }} | gzip > image.tar.gz
+
+      - name: Upload Docker image artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: docker-image
+          path: image.tar.gz
+          retention-days: 3
+
+  # ------------------------------------------------------------------
+  integration-test:
+    name: Integration test (container + secret)
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Docker image artifact (from the build job)
+        uses: actions/download-artifact@v8
+        with:
+          name: docker-image
+
+      - name: Load image
+        run: docker load < image.tar.gz
+
+      - name: Run container with the API key from GitHub Secrets
+        env:
+          # Repository secret. GitHub masks its value as *** in every log line.
+          DEMO_API_KEY: ${{ secrets.DEMO_API_KEY }}
+        run: |
+          if [ -z "$DEMO_API_KEY" ]; then
+            echo "::error::Secret DEMO_API_KEY is not configured"; exit 1
+          fi
+          echo "Secret DEMO_API_KEY is available (${#DEMO_API_KEY} characters)."
+          docker run -d --name calc -p 8000:8000 -e API_KEY="$DEMO_API_KEY" \
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          for i in $(seq 1 30); do
+            curl -fs http://localhost:8000/health && break
+            sleep 1
+          done
+
+      - name: Smoke-test the API
+        env:
+          DEMO_API_KEY: ${{ secrets.DEMO_API_KEY }}
+        run: |
+          set -x
+          curl -fsS http://localhost:8000/
+          curl -fsS "http://localhost:8000/api/add?a=2&b=3"
+          curl -fsS "http://localhost:8000/api/multiply?a=6&b=7"
+          # Without the key -> must be rejected with 401
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8000/api/secure/ping)" = "401"
+          # With the key from GitHub Secrets -> must be accepted with 200
+          curl -fsS -H "X-API-Key: $DEMO_API_KEY" http://localhost:8000/api/secure/ping
+
+      - name: Container logs
+        if: always()
+        run: docker logs calc
+
+      - name: Write job summary
+        run: |
+          {
+            echo "### CI result for \`${GITHUB_SHA::7}\`"
+            echo ""
+            echo "| Stage | Result |"
+            echo "|---|---|"
+            echo "| Lint | passed |"
+            echo "| Tests (5-runner matrix) | passed |"
+            echo "| Build bundle + Docker image | passed |"
+            echo "| Container smoke test with secret | passed |"
+          } >> "$GITHUB_STEP_SUMMARY"
